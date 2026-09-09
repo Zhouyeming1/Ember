@@ -1,0 +1,1203 @@
+import { describe, expect, it } from "vitest";
+import { visionAgentPrompt } from "../shared/vision-api";
+import { applyAgentEvent, approvalTitle, assistantErrorRecovered, assistantGroupSucceeded, assistantReplyText, baseName, cacheHitRate, collectFileChanges, collectTodos, collectWorkingFiles, delegateProgress, dropLastTurn, filterMentionPaths, formatCommand, formatThinking, friendlyAgentError, groupConversation, hasNewCheckpointUndo, isRecoverableRequestError, isTransientStreamError, lastTurnRestoreFiles, liveStatus, mentionedFiles, normalizeFilePath, normalizeMessages, omitFinalReply, optimisticUserMessage, parseFeaturesJson, planAwaitingApproval, recoverableFailStreaks, repairMarkdownTables, sessionTerminals, splitHttpUrls, splitPromptChips, splitPatch, stripEmptyMarkdown, terminalLabel, thoughtSteps, toolErrorText, toolSummary, toolWritePreview, takeTrailingUrl, isHttpUrl, urlChipLabel, spliceFileMention, traceRows, turnAnchorId, turnAnchors, turnWork, undoDialogTitle, workspaceRelative, type ChatMessage } from "./conversation";
+
+describe("conversation events", () => {
+  it("calculates prompt cache hit rate from reported token usage", () => {
+    expect(cacheHitRate({ input: 500, cacheRead: 9_500, cacheWrite: 0 })).toBe(95);
+    expect(cacheHitRate({ input: 0, cacheRead: 0, cacheWrite: 0 })).toBeUndefined();
+  });
+
+  it("streams one assistant message after an optimistic user prompt", () => {
+    let messages = [optimisticUserMessage("Build the desktop app")];
+    messages = applyAgentEvent(messages, {
+      type: "message_start",
+      message: { role: "user", content: [{ type: "text", text: "Build the desktop app" }] },
+    });
+    messages = applyAgentEvent(messages, {
+      type: "message_update",
+      message: { role: "assistant", content: [{ type: "text", text: "Working" }] },
+    });
+    messages = applyAgentEvent(messages, {
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "Working. Done." }] },
+    });
+
+    expect(messages).toHaveLength(2);
+    expect(messages[1]).toMatchObject({ role: "assistant", text: "Working. Done.", streaming: false });
+  });
+
+  it("does not append a duplicate user turn while the assistant is still empty", () => {
+    const messages = applyAgentEvent([
+      optimisticUserMessage("没事"),
+      { id: "a", role: "assistant", text: "", images: [], tools: [], work: [] },
+    ], {
+      type: "message_start",
+      message: { role: "user", content: [{ type: "text", text: "没事" }] },
+    });
+    expect(messages.filter((item) => item.role === "user")).toHaveLength(1);
+  });
+
+  it("hides the vision handoff user turn so write tools stay on the same assistant", () => {
+    const assistant = {
+      id: "vision-1",
+      role: "assistant" as const,
+      text: "",
+      thinking: "识图",
+      images: [] as [],
+      tools: [{ id: "v", name: "vision", title: "POST glm-4.6v-flash", status: "complete" as const }],
+      work: [],
+    };
+    let messages = [optimisticUserMessage("做成 html"), assistant];
+    messages = applyAgentEvent(messages, {
+      type: "message_start",
+      message: { role: "user", content: [{ type: "text", text: visionAgentPrompt("做成 html", ["D:/tmp/1.png"]) }] },
+    });
+    expect(messages).toHaveLength(2);
+    expect(messages.at(-1)?.role).toBe("assistant");
+    messages = applyAgentEvent(messages, {
+      type: "tool_execution_start",
+      toolCallId: "w1",
+      toolName: "exec_command",
+      args: { cmd: "cat > index.html" },
+    });
+    expect(messages.at(-1)?.tools.some((tool) => tool.id === "w1" || tool.name === "exec_command")).toBe(true);
+  });
+
+  it("still hides the handoff after the zero-width mark is stripped", () => {
+    const prompt = visionAgentPrompt("这是什么", ["/tmp/1.jpg"]).replace(/^\u200b/, "");
+    const local = optimisticUserMessage("这是什么", false, [{ data: "AAA", mimeType: "image/jpeg" }]);
+    const messages = applyAgentEvent([local], {
+      type: "message_start",
+      message: { role: "user", content: [{ type: "text", text: prompt }] },
+    });
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({ text: "这是什么", images: [{ data: "AAA", mimeType: "image/jpeg" }] });
+  });
+
+  it("unwraps a stored vision handoff into the original user text", () => {
+    const messages = normalizeMessages([{
+      role: "user",
+      content: [{ type: "text", text: visionAgentPrompt("这是什么", ["/tmp/1.jpg"]) }],
+    }]);
+    expect(messages[0]).toMatchObject({ role: "user", text: "这是什么" });
+  });
+
+  it("shows the model error when a turn fails", () => {
+    const messages = applyAgentEvent([optimisticUserMessage("你好")], {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [],
+        stopReason: "error",
+        errorMessage: "404 Not Found: /chat/completions",
+      },
+    });
+    expect(messages.at(-1)).toMatchObject({
+      role: "assistant",
+      error: "接口地址不可用，请检查 Base URL 是否包含正确的 API 路径",
+    });
+  });
+
+  it("turns common provider failures into actionable messages", () => {
+    expect(friendlyAgentError("Error: 401 Unauthorized")).toContain("API Key");
+    expect(friendlyAgentError("429 insufficient quota")).toContain("额度");
+    expect(friendlyAgentError("TypeError: fetch failed")).toContain("网络");
+    expect(friendlyAgentError("maximum context length exceeded")).toContain("压缩上下文");
+    expect(friendlyAgentError("unknown model deepseek-x")).toContain("切换模型");
+    expect(friendlyAgentError("503 status code (no body)")).toContain("网络");
+    expect(friendlyAgentError("504 <html><head><title>504 Gateway Time-out</title></head><body bgcolor=\"white\"><center><h1>504 Gateway Time-out</h1></center></body></html>")).toContain("超时");
+    expect(isTransientStreamError("Stream ended without finish_reason")).toBe(true);
+    expect(friendlyAgentError("Stream ended without finish_reason")).toBe("");
+  });
+
+  it("marks intermittent network/timeouts as recoverable", () => {
+    expect(isRecoverableRequestError("连接模型服务失败，请检查网络和 Base URL 后重试")).toBe(true);
+    expect(isRecoverableRequestError("模型响应超时，请稍后重试")).toBe(true);
+    expect(isRecoverableRequestError("模型流中断了（常见于停止委派后立刻继续）。点「继续」再试一次，或换个更稳的模型。")).toBe(true);
+    expect(isRecoverableRequestError("Connection error")).toBe(true);
+    expect(friendlyAgentError("Connection error")).toContain("网络");
+    expect(isRecoverableRequestError("接口地址不可用，请检查 Base URL 是否包含正确的 API 路径")).toBe(false);
+    expect(isRecoverableRequestError("当前模型不可用，请切换模型或检查模型名称")).toBe(false);
+    expect(friendlyAgentError("JSON error injected into SSE stream")).toMatch(/流中断|Continue|stream/i);
+  });
+
+  it("treats a turn with reply text as succeeded even if an earlier chunk had an error", () => {
+    const groups = groupConversation([
+      { id: "u1", role: "user", text: "hi", images: [], tools: [], work: [] },
+      { id: "a1", role: "assistant", text: "", images: [], tools: [], work: [], error: "连接模型服务失败，请检查网络和 Base URL 后重试" },
+      { id: "a2", role: "assistant", text: "done", images: [], tools: [], work: [] },
+    ]);
+    const assistant = groups[1]!;
+    expect(assistant.type).toBe("assistant");
+    if (assistant.type !== "assistant") return;
+    expect(assistantGroupSucceeded(assistant.messages)).toBe(true);
+    expect(assistantErrorRecovered(assistant.messages, groups, 1)).toBe(true);
+  });
+
+  it("counts consecutive recoverable failures and clears error after retry text arrives", () => {
+    const groups = groupConversation([
+      { id: "u1", role: "user", text: "one", images: [], tools: [], work: [] },
+      { id: "a1", role: "assistant", text: "", images: [], tools: [], work: [], error: "模型响应超时，请稍后重试" },
+      { id: "u2", role: "user", text: "continue", images: [], tools: [], work: [] },
+      { id: "a2", role: "assistant", text: "", images: [], tools: [], work: [], error: "模型响应超时，请稍后重试" },
+    ]);
+    expect(recoverableFailStreaks(groups)).toEqual([0, 1, 0, 1]);
+
+    let messages = applyAgentEvent([
+      { id: "a1", role: "assistant", text: "", images: [], tools: [], work: [], error: "模型响应超时，请稍后重试", streaming: false },
+    ], {
+      type: "message_update",
+      message: { role: "assistant", content: [{ type: "text", text: "ok" }] },
+    });
+    expect(messages[0]?.error).toBeUndefined();
+    expect(assistantReplyText(messages)).toBe("ok");
+  });
+
+  it("shows plan approval when plan mode has incomplete steps and the agent is idle", () => {
+    const todos = [
+      { id: "1", text: "读代码", done: true },
+      { id: "2", text: "改 UI", done: false, active: true },
+    ];
+    expect(planAwaitingApproval("plan", false, todos)).toBe(true);
+    expect(planAwaitingApproval("plan", true, todos)).toBe(false);
+    expect(planAwaitingApproval("auto", false, todos)).toBe(false);
+    expect(planAwaitingApproval("plan", false, [{ id: "1", text: "done", done: true }])).toBe(false);
+  });
+
+  it("keeps the command title when the end event has no args", () => {
+    let messages = applyAgentEvent([], {
+      type: "tool_execution_start",
+      toolCallId: "cmd-1",
+      toolName: "exec_command",
+      args: { cmd: "git status" },
+    });
+    messages = applyAgentEvent(messages, {
+      type: "tool_execution_end",
+      toolCallId: "cmd-1",
+      toolName: "exec_command",
+      result: { details: { command: "git status", exitCode: 0 } },
+      isError: false,
+    });
+
+    expect(messages[0]?.tools).toHaveLength(1);
+    expect(messages[0]?.tools[0]?.title).toBe("执行 git status");
+  });
+
+  it("keeps a yielded shell job in the inspect terminal list", () => {
+    let messages = applyAgentEvent([], {
+      type: "tool_execution_start",
+      toolCallId: "dev-1",
+      toolName: "exec_command",
+      args: { cmd: "pnpm dev" },
+    });
+    expect(sessionTerminals(messages).map((job) => job.command)).toEqual(["pnpm dev"]);
+    messages = applyAgentEvent(messages, {
+      type: "tool_execution_end",
+      toolCallId: "dev-1",
+      toolName: "exec_command",
+      args: { cmd: "pnpm dev" },
+      result: "process_id: abc123\nstatus: running\nsandbox: Seatbelt",
+      isError: false,
+    });
+    expect(sessionTerminals(messages)).toEqual([{ id: "abc123", command: "pnpm dev" }]);
+    messages = applyAgentEvent(messages, {
+      type: "tool_execution_end",
+      toolCallId: "stdin-1",
+      toolName: "write_stdin",
+      args: { process_id: "abc123", terminate: true },
+      result: "status: completed",
+      isError: false,
+    });
+    expect(sessionTerminals(messages)).toEqual([]);
+  });
+
+  it("formats chained shell commands", () => {
+    const cmd = `wc -l SkillToolApp/Sources/SkillToolApp/*.swift && echo "---" && cat SkillToolApp/Package.swift`;
+    expect(formatCommand(cmd)).toBe("wc -l SkillToolApp/Sources/SkillToolApp/*.swift\ncat SkillToolApp/Package.swift");
+    expect(terminalLabel("cd /Users/github-lzt/test2 && pnpm dev")).toBe("pnpm dev");
+    expect(applyAgentEvent([], {
+      type: "tool_execution_start",
+      toolCallId: "cmd-2",
+      toolName: "exec_command",
+      args: { cmd },
+    })[0]?.tools[0]?.title).toBe("执行 wc · 2 条命令");
+  });
+
+  it("correlates tool start and completion events", () => {
+    let messages = applyAgentEvent([], {
+      type: "tool_execution_start",
+      toolCallId: "call-1",
+      toolName: "apply_patch",
+      args: {},
+      timestamp: 1_700_000_000_000,
+    });
+    messages = applyAgentEvent(messages, {
+      type: "tool_execution_end",
+      toolCallId: "call-1",
+      toolName: "apply_patch",
+      result: "patched",
+      isError: false,
+      timestamp: 1_700_000_002_000,
+    });
+
+    expect(messages[0]?.tools).toHaveLength(1);
+    expect(messages[0]?.tools[0]).toMatchObject({
+      id: "call-1",
+      status: "complete",
+      output: "patched",
+      startedAt: 1_700_000_000_000,
+      endedAt: 1_700_000_002_000,
+    });
+  });
+
+  it("keeps the vision tool error text so the UI can show it", () => {
+    let messages = applyAgentEvent([], {
+      type: "tool_execution_start",
+      toolCallId: "v1",
+      toolName: "vision",
+    });
+    messages = applyAgentEvent(messages, {
+      type: "tool_execution_end",
+      toolCallId: "v1",
+      toolName: "vision",
+      isError: true,
+      result: { content: [{ type: "text", text: "invalid image" }] },
+    });
+    expect(messages[0]?.tools[0]).toMatchObject({ status: "error", title: "图片识别", output: "invalid image" });
+    expect(toolErrorText(messages[0]!.tools)).toBe("invalid image");
+  });
+
+  it("renames the vision chip once engine details arrive", () => {
+    let messages = applyAgentEvent([], {
+      type: "tool_execution_start",
+      toolCallId: "v2",
+      toolName: "vision",
+    });
+    expect(messages[0]?.tools[0]?.title).toBe("图片识别");
+    messages = applyAgentEvent(messages, {
+      type: "tool_execution_update",
+      toolCallId: "v2",
+      toolName: "vision",
+      partialResult: {
+        details: {
+          model: "mineru-ocr",
+          engines: ["mineru-ocr"],
+          images: 1,
+          ocr: true,
+          glm: false,
+        },
+      },
+    });
+    expect(messages[0]?.tools[0]?.title).toBe("MinerU OCR");
+    messages = applyAgentEvent(messages, {
+      type: "tool_execution_end",
+      toolCallId: "v2",
+      toolName: "vision",
+      result: {
+        content: [{ type: "text", text: "OCR 提取文字（MinerU）：\nhello" }],
+        details: {
+          model: "glm-4v-flash",
+          engines: ["glm-4v-flash", "mineru-ocr"],
+          images: 1,
+          ocr: true,
+          glm: true,
+        },
+      },
+    });
+    expect(messages[0]?.tools[0]?.title).toBe("识图 · glm-4v-flash · MinerU OCR");
+  });
+
+  it("tracks delegate progress from start through cumulative updates", () => {
+    const tasks = [
+      { role: "explorer", task: "read main" },
+      { role: "explorer", task: "read renderer" },
+      { role: "reviewer", task: "check types" },
+    ];
+    let messages = applyAgentEvent([], {
+      type: "tool_execution_start",
+      toolCallId: "d1",
+      toolName: "delegate",
+      args: { tasks },
+    });
+    expect(messages[0]?.tools[0]?.title).toBe("委托 0/3");
+    expect(liveStatus(messages[0]!.tools)).toBe("委托中 0/3");
+    expect(traceRows(messages[0]!.work, messages[0]!.tools).map((row) => [row.label, row.chip])).toEqual([
+      ["委托", "0/3 · explorer · read main"],
+    ]);
+
+    messages = applyAgentEvent(messages, {
+      type: "tool_execution_update",
+      toolCallId: "d1",
+      toolName: "delegate",
+      args: { tasks },
+      partialResult: {
+        details: {
+          total: 3,
+          done: 1,
+          tasks: [
+            { role: "explorer", task: "read main", status: "completed" },
+            { role: "explorer", task: "read renderer", status: "running", live: "正在读取 src/renderer/ui.tsx" },
+            { role: "reviewer", task: "check types", status: "pending" },
+          ],
+          results: [{ role: "explorer", task: "read main", success: true, output: "ok" }],
+        },
+      },
+    });
+    expect(messages[0]?.tools[0]?.title).toBe("委托 1/3");
+    expect(liveStatus(messages[0]!.tools)).toBe("正在读取 src/renderer/ui.tsx");
+    expect(traceRows(messages[0]!.work, messages[0]!.tools).map((row) => row.chip)).toEqual([
+      "1/3 · 正在读取 src/renderer/ui.tsx",
+    ]);
+    expect(delegateProgress(messages[0]!.tools[0]!).tasks.map((item) => [item.status, item.live ?? ""])).toEqual([
+      ["completed", ""],
+      ["running", "正在读取 src/renderer/ui.tsx"],
+      ["pending", ""],
+    ]);
+
+    messages = applyAgentEvent(messages, {
+      type: "tool_execution_update",
+      toolCallId: "d1",
+      toolName: "delegate",
+      args: { tasks },
+      partialResult: {
+        details: {
+          total: 3,
+          done: 1,
+          tasks: [
+            { role: "explorer", task: "read main", status: "completed" },
+            { role: "explorer", task: "read renderer", status: "running", live: "正在执行 pnpm test" },
+            { role: "reviewer", task: "check types", status: "pending" },
+          ],
+        },
+      },
+    });
+    expect(delegateProgress(messages[0]!.tools[0]!).tasks[1]?.live).toBe("正在执行 pnpm test");
+    expect((messages[0]!.tools[0]!.details as { results?: unknown[] }).results).toHaveLength(1);
+
+    messages = applyAgentEvent(messages, {
+      type: "tool_execution_end",
+      toolCallId: "d1",
+      toolName: "delegate",
+      args: { tasks },
+      result: {
+        content: [{ type: "text", text: "all done" }],
+        details: {
+          total: 3,
+          done: 3,
+          tasks: tasks.map((task) => ({ ...task, status: "completed" })),
+          results: tasks.map((task) => ({ ...task, success: true, output: "ok" })),
+        },
+      },
+    });
+    expect(messages[0]?.tools[0]).toMatchObject({ status: "complete", title: "委托 3/3" });
+    expect(traceRows(messages[0]!.work, messages[0]!.tools)[0]?.chip).toBe("3/3 · explorer · read main");
+  });
+
+  it("marks running tools as interrupted when the turn settles early", () => {
+    let messages = applyAgentEvent([], {
+      type: "tool_execution_start",
+      toolCallId: "x1",
+      toolName: "exec_command",
+      args: { cmd: "sleep 10" },
+    });
+    expect(messages[0]?.tools[0]?.status).toBe("running");
+    messages = applyAgentEvent(messages, { type: "agent_settled" });
+    expect(messages[0]?.streaming).toBe(false);
+    expect(messages[0]?.tools[0]?.status).toBe("error");
+    expect(messages[0]?.tools[0]?.output).toMatch(/中断|Interrupted/);
+  });
+
+  it("does not treat delegate args.command as a shell row", () => {
+    const messages = applyAgentEvent([], {
+      type: "tool_execution_start",
+      toolCallId: "d3",
+      toolName: "delegate",
+      args: {
+        command: "cat src/shared/types.ts",
+        tasks: [
+          { role: "explorer", task: "精读主进程与 preload" },
+          { role: "explorer", task: "精读渲染层" },
+        ],
+      },
+    });
+    expect(traceRows(messages[0]!.work, messages[0]!.tools).map((row) => [row.kind, row.label, row.chip])).toEqual([
+      ["tool", "委托", "0/2 · explorer · 精读主进程与 preload"],
+    ]);
+  });
+
+  it("shows web search queries on the trace chip", () => {
+    const messages = applyAgentEvent([], {
+      type: "tool_execution_end",
+      toolCallId: "s1",
+      toolName: "web_search",
+      args: { query: "vite rolldown" },
+      result: {
+        details: {
+          totalResults: 1,
+          curatedQueries: [{ sources: [{ title: "Vite", url: "https://vite.dev" }] }],
+        },
+      },
+    });
+    expect(traceRows(messages[0]!.work, messages[0]!.tools).map((row) => [row.kind, row.label, row.chip])).toEqual([
+      ["search", "网页搜索", "vite rolldown"],
+    ]);
+  });
+
+  it("accumulates legacy single-result delegate updates", () => {
+    const tasks = [
+      { role: "explorer", task: "a" },
+      { role: "explorer", task: "b" },
+    ];
+    let messages = applyAgentEvent([], {
+      type: "tool_execution_start",
+      toolCallId: "d2",
+      toolName: "delegate",
+      args: { tasks },
+    });
+    messages = applyAgentEvent(messages, {
+      type: "tool_execution_update",
+      toolCallId: "d2",
+      toolName: "delegate",
+      args: { tasks },
+      partialResult: {
+        details: { results: [{ role: "explorer", task: "a", success: true, output: "1" }] },
+      },
+    });
+    messages = applyAgentEvent(messages, {
+      type: "tool_execution_update",
+      toolCallId: "d2",
+      toolName: "delegate",
+      args: { tasks },
+      partialResult: {
+        details: { results: [{ role: "explorer", task: "b", success: true, output: "2" }] },
+      },
+    });
+    const details = messages[0]?.tools[0]?.details as { results?: unknown[] };
+    expect(details.results).toHaveLength(2);
+    expect(delegateProgress(messages[0]!.tools[0]!).done).toBe(2);
+  });
+
+  it("normalizes stored assistant tool calls", () => {
+    const messages = normalizeMessages([
+      {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "tool-1", name: "exec_command", arguments: { cmd: "rg --files" } },
+          { type: "text", text: "Done." },
+        ],
+      },
+      {
+        role: "toolResult",
+        toolCallId: "tool-1",
+        content: [{ type: "text", text: "src/index.ts" }],
+        isError: false,
+      },
+    ]);
+    expect(messages[0]).toMatchObject({ role: "assistant", text: "Done." });
+    expect(messages[0]?.tools[0]).toMatchObject({ id: "tool-1", title: "执行 rg --files", output: "src/index.ts" });
+  });
+
+  it("keeps one assistant turn across thinking, tools, and later text", () => {
+    let messages = [optimisticUserMessage("能改文件吗")];
+    messages = applyAgentEvent(messages, {
+      type: "message_start",
+      message: { role: "assistant", content: [{ type: "thinking", thinking: "The user asks" }] },
+    });
+    messages = applyAgentEvent(messages, {
+      type: "message_update",
+      message: { role: "assistant", content: [{ type: "thinking", thinking: "The user asks if I can modify files." }] },
+    });
+    messages = applyAgentEvent(messages, {
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "thinking", thinking: "The user asks if I can modify files." }] },
+    });
+    messages = applyAgentEvent(messages, {
+      type: "tool_execution_start",
+      toolCallId: "cmd-1",
+      toolName: "exec_command",
+      args: { cmd: "git status" },
+      timestamp: 1_700_000_000,
+    });
+    messages = applyAgentEvent(messages, {
+      type: "message_start",
+      message: { role: "assistant", content: [{ type: "thinking", thinking: "No AGENTS.md, continue." }] },
+    });
+    messages = applyAgentEvent(messages, {
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "可以改。" }] },
+    });
+    messages = applyAgentEvent(messages, { type: "agent_settled" });
+
+    expect(messages).toHaveLength(2);
+    expect(messages[1]).toMatchObject({
+      role: "assistant",
+      streaming: false,
+      text: "可以改。",
+    });
+    expect(messages[1]?.thinking).toContain("The user asks if I can modify files.");
+    expect(messages[1]?.thinking).toContain("No AGENTS.md, continue.");
+    expect(messages[1]?.tools).toHaveLength(1);
+  });
+
+  it("keeps one copy when thinking snapshots grow in place", () => {
+    const prefix = "I now have a thorough understanding of the app. Let me look at a few more details: the disabled items handling";
+    let messages = applyAgentEvent([], {
+      type: "message_start",
+      message: { role: "assistant", content: [{ type: "thinking", thinking: prefix }] },
+    });
+    messages = applyAgentEvent(messages, {
+      type: "message_update",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: prefix },
+          { type: "thinking", thinking: `${prefix}, the settings toggle` },
+        ],
+      },
+    });
+    messages = applyAgentEvent(messages, {
+      type: "message_update",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: prefix },
+          { type: "thinking", thinking: `${prefix}, the settings toggle` },
+          { type: "thinking", thinking: `${prefix}, the settings toggle "删除前确认"` },
+        ],
+      },
+    });
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.thinking).toBe(`${prefix}, the settings toggle "删除前确认"`);
+    expect(messages[0]?.thinking?.split(prefix).length).toBe(2);
+  });
+
+  it("ignores files that were only listed or read", () => {
+    expect(collectFileChanges([
+      {
+        id: "1",
+        name: "exec_command",
+        title: "Ran find",
+        status: "complete",
+        output: "src/App.swift\n.build/Symbols-ABC.swiftmodule\nREADME.md",
+      },
+      {
+        id: "2",
+        name: "read_file",
+        title: "Read src/App.swift",
+        status: "complete",
+        args: { path: "src/App.swift" },
+      },
+    ])).toEqual([]);
+  });
+
+  it("collects files that were only read into the working set", () => {
+    expect(collectWorkingFiles([
+      {
+        id: "1",
+        name: "read_file",
+        title: "Read src/App.swift",
+        status: "complete",
+        args: { path: "src/App.swift" },
+      },
+      {
+        id: "2",
+        name: "exec_command",
+        title: "Ran git status",
+        status: "complete",
+        args: { cmd: "git status" },
+      },
+    ])).toEqual([
+      { path: "src/App.swift", kind: "read", additions: 0, deletions: 0 },
+    ]);
+    expect(toolSummary([
+      { id: "1", name: "read_file", title: "Read a", status: "complete", args: { path: "a.ts" } },
+      { id: "2", name: "read_file", title: "Read b", status: "complete", args: { path: "b.ts" } },
+      { id: "3", name: "exec_command", title: "Ran ls", status: "complete" },
+    ])).toBe("读了 2 个文件，跑了 1 条命令");
+    expect(toolSummary([
+      { id: "3", name: "exec_command", title: "Ran ls", status: "complete" },
+    ], 6)).toBe("思考了 6 次，跑了 1 条命令");
+    expect(thoughtSteps(
+      [
+        { type: "thinking", id: "t1", text: "先看结构" },
+        { type: "tool", id: "w1", toolId: "1" },
+        { type: "thinking", id: "t2", text: "再读源码" },
+        { type: "tool", id: "w2", toolId: "3" },
+      ],
+      [
+        { id: "1", name: "read_file", title: "Read a", status: "complete", args: { path: "a.ts" } },
+        { id: "3", name: "exec_command", title: "Ran ls", status: "complete" },
+      ],
+    )).toEqual([
+      { text: "先看结构", tools: [{ id: "1", name: "read_file", title: "Read a", status: "complete", args: { path: "a.ts" } }] },
+      { text: "再读源码", tools: [{ id: "3", name: "exec_command", title: "Ran ls", status: "complete" }] },
+    ]);
+  });
+
+  it("folds a turn into label + chip rows, merging neighbouring thoughts", () => {
+    expect(traceRows(
+      [
+        { type: "thinking", id: "t1", text: "先看结构\n\n再读源码" },
+        { type: "tool", id: "w1", toolId: "1" },
+        { type: "tool", id: "w2", toolId: "2" },
+      ],
+      [
+        { id: "1", name: "exec_command", title: "Ran ls", status: "complete", args: { cmd: "npm run freeze" } },
+        {
+          id: "2",
+          name: "apply_patch",
+          title: "Edited App.tsx",
+          status: "complete",
+          args: { input: "*** Update File: src/App.tsx\n+const a = 1\n+const b = 2\n" },
+        },
+      ],
+    ).map((row) => [row.kind, row.label, row.chip])).toEqual([
+      ["think", "思考", "先看结构"],
+      ["run", "执行命令", "npm run freeze"],
+      ["write", "写入 2 行", "App.tsx"],
+    ]);
+  });
+
+  it("shows collapsed thinking when the final message only left tool steps", () => {
+    const tools = [{ id: "1", name: "exec_command", title: "Ran ls", status: "complete" as const }];
+    expect(thoughtSteps(
+      [{ type: "tool", id: "w1", toolId: "1" }],
+      tools,
+      "先看结构\n\n再读源码",
+    )).toEqual([
+      { text: "先看结构", tools: [] },
+      { text: "再读源码", tools },
+    ]);
+  });
+
+  it("keeps streamed thinking when the closing message drops it", () => {
+    const streamed = applyAgentEvent([], {
+      type: "message_start",
+      message: { role: "assistant", content: [{ type: "thinking", thinking: "先看结构" }] },
+    } as never);
+    const closed = applyAgentEvent(streamed, {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "1", name: "exec_command", arguments: {} },
+          { type: "text", text: "改完了" },
+        ],
+      },
+    } as never);
+    expect(closed.at(-1)!.work.some((item) => item.type === "thinking")).toBe(true);
+    expect(closed.at(-1)!.thinking).toBe("先看结构");
+  });
+
+  it("keeps every thought of a turn in order across snapshots", () => {
+    let messages = applyAgentEvent([], {
+      type: "message_start",
+      message: { role: "assistant", content: [{ type: "thinking", thinking: "先看 startTime 是怎么传的" }] },
+    } as never);
+    messages = applyAgentEvent(messages, {
+      type: "tool_execution_start",
+      toolCallId: "cmd-1",
+      toolName: "exec_command",
+      args: { cmd: "rg startTime" },
+    } as never);
+    messages = applyAgentEvent(messages, {
+      type: "message_start",
+      message: { role: "assistant", content: [{ type: "thinking", thinking: "后端要 00:00:00 ~ 23:59:59" }] },
+    } as never);
+    messages = applyAgentEvent(messages, {
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "改好了" }] },
+    } as never);
+
+    const message = messages.at(-1)!;
+    expect(thoughtSteps(message.work, message.tools, message.thinking).map((step) => step.text)).toEqual([
+      "先看 startTime 是怎么传的",
+      "后端要 00:00:00 ~ 23:59:59",
+      "改好了",
+    ]);
+    expect(thoughtSteps(message.work, message.tools, message.thinking)[0]?.tools.map((tool) => tool.id)).toEqual(["cmd-1"]);
+  });
+
+  it("keeps every inter-tool text beat instead of replacing the last one", () => {
+    let messages = applyAgentEvent([], {
+      type: "message_start",
+      message: { role: "assistant", content: [{ type: "text", text: "先看导航" }] },
+    } as never);
+    messages = applyAgentEvent(messages, {
+      type: "tool_execution_start",
+      toolCallId: "cmd-1",
+      toolName: "exec_command",
+      args: { cmd: "ls" },
+    } as never);
+    messages = applyAgentEvent(messages, {
+      type: "message_start",
+      message: { role: "assistant", content: [{ type: "text", text: "再改链接" }] },
+    } as never);
+    messages = applyAgentEvent(messages, {
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "完成。" }] },
+    } as never);
+    const message = messages.at(-1)!;
+    expect(thoughtSteps(message.work, message.tools).map((step) => step.text)).toEqual([
+      "先看导航",
+      "再改链接",
+      "完成。",
+    ]);
+    expect(thoughtSteps(omitFinalReply(message.work, message.text), message.tools).map((step) => step.text)).toEqual([
+      "先看导航",
+      "再改链接",
+    ]);
+  });
+
+  it("keeps every thought when a stored turn spans several messages", () => {
+    const messages = normalizeMessages([
+      { role: "assistant", content: [{ type: "thinking", thinking: "先看 startTime 是怎么传的" }] },
+      { role: "assistant", content: [{ type: "toolCall", id: "cmd-1", name: "exec_command", arguments: { cmd: "rg startTime" } }] },
+      { role: "assistant", content: [{ type: "thinking", thinking: "后端要 00:00:00 ~ 23:59:59" }, { type: "text", text: "改好了" }] },
+    ]);
+    const work = turnWork(messages);
+    expect(thoughtSteps(work, messages.flatMap((item) => item.tools)).map((step) => step.text)).toEqual([
+      "先看 startTime 是怎么传的",
+      "后端要 00:00:00 ~ 23:59:59",
+      "改好了",
+    ]);
+    expect(thoughtSteps(omitFinalReply(work, "改好了"), messages.flatMap((item) => item.tools)).map((step) => step.text)).toEqual([
+      "先看 startTime 是怎么传的",
+      "后端要 00:00:00 ~ 23:59:59",
+    ]);
+  });
+
+  it("reloaded turns only show the last text outside the thinking panel", () => {
+    const messages = normalizeMessages([
+      { role: "assistant", content: [{ type: "text", text: "先搜一下杭州发呆大赛" }, { type: "toolCall", id: "t1", name: "exec_command", arguments: { cmd: "curl bing" } }] },
+      { role: "assistant", content: [{ type: "text", text: "Bing 没找到，换搜狗" }, { type: "toolCall", id: "t2", name: "exec_command", arguments: { cmd: "curl sogou" } }] },
+      { role: "assistant", content: [{ type: "text", text: "冠军是刘子亭。" }] },
+    ]);
+    expect(assistantReplyText(messages)).toBe("冠军是刘子亭。");
+    const work = omitFinalReply(turnWork(messages), assistantReplyText(messages));
+    expect(thoughtSteps(work, messages.flatMap((item) => item.tools)).map((step) => step.text)).toEqual([
+      "先搜一下杭州发呆大赛",
+      "Bing 没找到，换搜狗",
+    ]);
+  });
+
+  it("keeps @ mentioned files in the working set", () => {
+    const messages = [
+      optimisticUserMessage("@yq.html 看一下这个页面"),
+      optimisticUserMessage("@src/views/merchant/ 这个目录呢"),
+    ];
+    expect(mentionedFiles(messages)).toEqual(["yq.html"]);
+    expect(collectWorkingFiles([], mentionedFiles(messages))).toEqual([
+      { path: "yq.html", kind: "read", additions: 0, deletions: 0 },
+    ]);
+  });
+
+  it("prefers checklist todos from the assistant reply", () => {
+    expect(collectTodos([
+      {
+        id: "a",
+        role: "assistant",
+        text: "计划：\n- [ ] 核验 README\n- [x] 重写文档\n- [ ] 检查渲染",
+        images: [],
+        tools: [],
+        work: [],
+      },
+    ]).map((item) => item.text)).toEqual(["核验 README", "重写文档", "检查渲染"]);
+  });
+
+  it("does not treat numbered document headings as todos", () => {
+    expect(collectTodos([
+      {
+        id: "a",
+        role: "assistant",
+        text: "1. 9 家模型供应商\n2. 项目工作台\n3. Agent 会话\n4. 输入体验",
+        images: [],
+        tools: [],
+        work: [],
+      },
+    ])).toEqual([]);
+  });
+
+  it("lists the latest update_plan steps in the inspect rail", () => {
+    const plan = (id: string, steps: Array<{ step: string; status: string }>): ChatMessage => ({
+      id,
+      role: "assistant",
+      text: "",
+      images: [],
+      tools: [{
+        id: `tool-${id}`,
+        name: "update_plan",
+        title: "Update plan",
+        status: "complete",
+        args: { plan: steps },
+      }],
+      work: [],
+    });
+    expect(collectTodos([
+      plan("old", [{ step: "过时步骤", status: "pending" }]),
+      plan("new", [
+        { step: "读代码", status: "completed" },
+        { step: "改 UI", status: "in_progress" },
+        { step: "补测试", status: "pending" },
+      ]),
+    ])).toEqual([
+      { id: "plan-0", text: "读代码", done: true },
+      { id: "plan-1", text: "改 UI", done: false, active: true },
+      { id: "plan-2", text: "补测试", done: false },
+    ]);
+  });
+
+  it("collapses consecutive update_plan rows to the latest progress", () => {
+    const plan = (id: string, steps: Array<{ step: string; status: string }>) => ({
+      id,
+      name: "update_plan",
+      title: "Update plan",
+      status: "complete" as const,
+      args: { plan: steps },
+    });
+    expect(traceRows(
+      [
+        { type: "tool", id: "w1", toolId: "1" },
+        { type: "tool", id: "w2", toolId: "2" },
+        { type: "tool", id: "w3", toolId: "3" },
+      ],
+      [
+        plan("1", [
+          { step: "读代码", status: "in_progress" },
+          { step: "改 UI", status: "pending" },
+        ]),
+        plan("2", [
+          { step: "读代码", status: "completed" },
+          { step: "改 UI", status: "in_progress" },
+        ]),
+        plan("3", [
+          { step: "读代码", status: "completed" },
+          { step: "改 UI", status: "completed" },
+        ]),
+      ],
+    ).map((row) => [row.label, row.chip])).toEqual([
+      ["更新计划", "2/2"],
+    ]);
+  });
+
+  it("advances plan progress from write bursts when update_plan stays at 0/4", () => {
+    const messages: ChatMessage[] = [{
+      id: "a",
+      role: "assistant",
+      text: "",
+      images: [],
+      tools: [
+        {
+          id: "plan",
+          name: "update_plan",
+          title: "Update plan",
+          status: "complete",
+          args: { plan: [
+            { step: "注释类型", status: "in_progress" },
+            { step: "注释 DOM", status: "pending" },
+            { step: "注释导出", status: "pending" },
+            { step: "校验", status: "pending" },
+          ] },
+        },
+        { id: "w1", name: "apply_patch", title: "Edited a.ts", status: "complete", args: { input: "*** Update File: a.ts\n+a\n" } },
+        { id: "w2", name: "apply_patch", title: "Edited a.ts", status: "complete", args: { input: "*** Update File: a.ts\n+b\n" } },
+        { id: "cd", name: "exec_command", title: "cd", status: "complete", args: { cmd: "cd /tmp" } },
+        { id: "w3", name: "apply_patch", title: "Edited a.ts", status: "complete", args: { input: "*** Update File: a.ts\n+c\n" } },
+      ],
+      work: [
+        { type: "tool", id: "wp", toolId: "plan" },
+        { type: "tool", id: "ww1", toolId: "w1" },
+        { type: "thinking", id: "t1", text: "下一块" },
+        { type: "tool", id: "ww2", toolId: "w2" },
+        { type: "tool", id: "wcd", toolId: "cd" },
+        { type: "thinking", id: "t2", text: "再一块" },
+        { type: "tool", id: "ww3", toolId: "w3" },
+      ],
+    }];
+    expect(collectTodos(messages).map((item) => [item.done, item.active ?? false, item.text])).toEqual([
+      [true, false, "注释类型"],
+      [true, false, "注释 DOM"],
+      [true, false, "注释导出"],
+      [false, true, "校验"],
+    ]);
+    expect(traceRows(messages[0]!.work, messages[0]!.tools).map((row) => row.kind === "tool" ? row.chip : undefined).filter(Boolean)).toEqual([
+      "3/4 · 校验",
+    ]);
+  });
+
+  it("parses features.json into session todos", () => {
+    expect(parseFeaturesJson(JSON.stringify([
+      { id: "chat", description: "新对话按钮创建空白会话", passes: true },
+      { id: "drawer", description: "右侧抽屉可开关", passes: false },
+    ]))).toEqual([
+      { id: "chat", text: "新对话按钮创建空白会话", done: true },
+      { id: "drawer", text: "右侧抽屉可开关", done: false },
+    ]);
+    expect(parseFeaturesJson("{")).toEqual([]);
+  });
+
+  it("splits collapsed markdown table rows", () => {
+    expect(repairMarkdownTables("| 部分 | 作用 || ------ | ------ || name | 包标识名 |")).toBe(
+      "| 部分 | 作用 |\n| ------ | ------ |\n| name | 包标识名 |",
+    );
+  });
+
+  it("drops empty fenced code blocks that would paint blank gray boxes", () => {
+    expect(stripEmptyMarkdown("英文版对比表：\n\n```markdown\n\n```\n\n继续")).toBe("英文版对比表：\n\n继续");
+    expect(stripEmptyMarkdown("前面\n```\n```\n后面")).toBe("前面\n\n后面");
+    expect(stripEmptyMarkdown("```ts\nconst x = 1\n```")).toBe("```ts\nconst x = 1\n```");
+  });
+
+  it("pairs patch lines into a split view", () => {
+    expect(splitPatch("*** Update File: a.html\n@@\n-old\n+new\n context\n+only")).toEqual([
+      { kind: "meta", old: "*** Update File: a.html", next: "" },
+      { kind: "meta", old: "@@", next: "" },
+      { kind: "del", old: "old", next: "" },
+      { kind: "add", old: "", next: "new" },
+      { kind: "ctx", old: "context", next: "context" },
+      { kind: "add", old: "", next: "only" },
+    ]);
+  });
+
+  it("shows writing progress from apply_patch input", () => {
+    expect(liveStatus([{
+      id: "1",
+      name: "apply_patch",
+      title: "Wrote about.html",
+      status: "running",
+      args: { input: "*** Begin Patch\n*** Add File: about.html\n+<h1>Hi</h1>\n*** End Patch" },
+    }])).toMatch(/正在写入 about\.html · 约 .+ 字符/);
+    expect(liveStatus([])).toBe("思考中…");
+  });
+
+  it("uses the latest edit counts when the same file is patched again", () => {
+    const files = collectFileChanges([
+      {
+        id: "1",
+        name: "apply_patch",
+        title: "Edited 1.html",
+        status: "complete",
+        args: { input: "*** Begin Patch\n*** Update File: 1.html\n@@\n-a\n+b\n+c\n*** End Patch" },
+      },
+      {
+        id: "2",
+        name: "apply_patch",
+        title: "Edited 1.html",
+        status: "complete",
+        args: { input: "*** Begin Patch\n*** Update File: 1.html\n@@\n-x\n+y\n*** End Patch" },
+      },
+    ]);
+    expect(files).toMatchObject([{ path: "1.html", additions: 1, deletions: 1 }]);
+  });
+
+  it("collects added and deleted lines from apply_patch input", () => {
+    const files = collectFileChanges([{
+      id: "1",
+      name: "apply_patch",
+      title: "Edited src/App.vue",
+      status: "complete",
+      args: {
+        input: "*** Begin Patch\n*** Update File: src/App.vue\n@@\n-old\n+new line\n+another\n*** End Patch",
+      },
+      output: "Applied patch to 1 file(s): +2 -1\nsrc/App.vue",
+    }]);
+    expect(files).toEqual([
+      { path: "src/App.vue", additions: 2, deletions: 1, patch: expect.stringContaining("+new line") },
+    ]);
+  });
+
+  it("merges the same file when Windows and POSIX paths are mixed", () => {
+    expect(collectFileChanges([{
+      id: "1",
+      name: "apply_patch",
+      title: "Edited DyParser.vue",
+      status: "complete",
+      args: {
+        input: "*** Begin Patch\n*** Update File: src/components/DyParser.vue\n@@\n-old\n+new\n*** End Patch",
+      },
+      details: { files: ["src\\components\\DyParser.vue"], additions: 1, deletions: 1 },
+      output: "Applied patch to 1 file(s): +1 -1\nsrc\\components\\DyParser.vue",
+    }])).toEqual([
+      { path: "src/components/DyParser.vue", additions: 1, deletions: 1, patch: expect.stringContaining("+new") },
+    ]);
+    expect(normalizeFilePath(".\\src\\App.vue")).toBe("src/App.vue");
+  });
+
+  it("lists top-level folders first, then one level of children after a prefix", () => {
+    const files = [
+      "README.md",
+      "src/",
+      "src/App.tsx",
+      "src/views/",
+      "src/views/list.vue",
+      "src/views/merchant/",
+      "src/views/merchant/management/",
+      "src/views/merchant/phase/",
+      "src/views/merchant/player/",
+      "src/views/merchant/management/components/",
+      "package.json",
+    ];
+    expect(filterMentionPaths(files, "")).toEqual(["src/", "package.json", "README.md"]);
+    expect(filterMentionPaths(files, "src/")).toEqual(["src/", "src/views/", "src/App.tsx"]);
+    expect(filterMentionPaths(files, "src/views/")).toEqual(["src/views/", "src/views/merchant/", "src/views/list.vue"]);
+    expect(filterMentionPaths(files, "src/views/merchant")).toEqual([
+      "src/views/merchant/",
+      "src/views/merchant/management/",
+      "src/views/merchant/phase/",
+      "src/views/merchant/player/",
+    ]);
+  });
+
+  it("inserts a file mention at the caret without duplicating the path", () => {
+    expect(spliceFileMention("哈哈", "README.md", 2)).toEqual({ next: "哈哈 @README.md ", caret: 14 });
+    expect(spliceFileMention("", "src/App.tsx", 0)).toEqual({ next: "@src/App.tsx ", caret: 13 });
+  });
+
+  it("maps Finder drop paths onto workspace-relative mentions", () => {
+    expect(workspaceRelative("/proj/README.md", "/proj")).toBe("README.md");
+    expect(workspaceRelative("/proj/docs/a.md", "/proj")).toBe("docs/a.md");
+    expect(workspaceRelative("/proj", "/proj")).toBe("");
+    expect(workspaceRelative("/other/a.md", "/proj")).toBeUndefined();
+  });
+
+  it("turns a finished http(s) URL into a chip label", () => {
+    expect(isHttpUrl("https://github.com/Zhouyeming1/Ember")).toBe(true);
+    expect(urlChipLabel("https://github.com/Zhouyeming1/Ember")).toBe("github.com/Zhouyeming1/Ember");
+    const typed = "see https://example.com/a.";
+    expect(takeTrailingUrl(typed, typed.length)).toEqual({
+      url: "https://example.com/a",
+      next: "see ",
+    });
+    expect(splitHttpUrls("https://github.com/Zhouyeming1/Ember 这是什么")).toEqual([
+      { type: "url", value: "https://github.com/Zhouyeming1/Ember" },
+      { type: "text", value: " 这是什么" },
+    ]);
+    expect(splitPromptChips("看 @src/App.tsx 和 https://example.com/a")).toEqual([
+      { type: "text", value: "看 " },
+      { type: "file", value: "src/App.tsx" },
+      { type: "text", value: " 和 " },
+      { type: "url", value: "https://example.com/a" },
+    ]);
+  });
+
+  it("keeps all direct children when browsing a wide folder", () => {
+    const files = [
+      "wide/",
+      ...Array.from({ length: 100 }, (_, index) => `wide/dir-${String(index).padStart(3, "0")}/`),
+      ...Array.from({ length: 20 }, (_, index) => `wide/file-${String(index).padStart(3, "0")}.ts`),
+    ];
+    const matches = filterMentionPaths(files, "wide/");
+    expect(matches).toHaveLength(121);
+    expect(matches[0]).toBe("wide/");
+    expect(matches).toContain("wide/dir-099/");
+    expect(matches).toContain("wide/file-019.ts");
+  });
+
+  it("drops the last user turn and following assistant replies", () => {
+    const user = optimisticUserMessage("加上我的");
+    const assistant = { ...optimisticUserMessage(""), id: "a", role: "assistant" as const, text: "已加上" };
+    expect(dropLastTurn([user, assistant]).map((item) => item.id)).toEqual([]);
+    expect(dropLastTurn([optimisticUserMessage("先问"), user, assistant]).map((item) => item.text)).toEqual(["先问"]);
+    expect(dropLastTurn([user]).map((item) => item.id)).toEqual([]);
+    expect(dropLastTurn([])).toEqual([]);
+  });
+
+  it("restores every last-turn checkpoint, keeping the earliest before per file", () => {
+    expect(lastTurnRestoreFiles([
+      { type: "message", message: { role: "user", content: "先改 html" } },
+      { type: "custom", customType: "ember-checkpoint", data: { id: "old", before: [{ path: "stale.html", content: "no" }] } },
+      { type: "message", message: { role: "user", content: "再改 css" } },
+      { type: "custom", customType: "ember-checkpoint", data: { id: "html", before: [{ path: "index.html", content: "<old>" }] } },
+      { type: "custom", customType: "ember-checkpoint", data: { id: "css", before: [{ path: "style.css", content: "body{}" }, { path: "index.html", content: "<mid>" }] } },
+    ])).toEqual([
+      { path: "index.html", content: "<old>" },
+      { path: "style.css", content: "body{}" },
+    ]);
+  });
+
+  it("skips undone checkpoints and does not treat /undo as a new turn", () => {
+    expect(lastTurnRestoreFiles([
+      { type: "message", message: { role: "user", content: "改" } },
+      { type: "custom", customType: "ember-checkpoint", data: { id: "c1", before: [{ path: "a.css", content: "x" }] } },
+      { type: "custom", customType: "ember-checkpoint-undone", data: { checkpointId: "c1" } },
+      { type: "message", message: { role: "user", content: [{ type: "text", text: "/undo" }] } },
+    ])).toEqual([]);
+  });
+
+  it("only treats a new checkpoint-undone entry as a successful undo", () => {
+    const before = [{ id: "a", type: "message" }, { id: "b", type: "custom", customType: "ember-checkpoint" }];
+    expect(hasNewCheckpointUndo(before, before)).toBe(false);
+    expect(hasNewCheckpointUndo(before, [...before, { id: "c", type: "custom", customType: "ember-checkpoint-undone" }])).toBe(true);
+    expect(hasNewCheckpointUndo(before, [...before, { id: "c", type: "custom", customType: "ember-checkpoint" }])).toBe(false);
+  });
+
+  it("rewrites undo confirm titles to the last user turn", () => {
+    expect(undoDialogTitle("Undo 7f6eb0f8-6a0?", "在新增一个我的")).toBe("撤回「在新增一个我的」？");
+    expect(undoDialogTitle("Undo abc?", "x".repeat(40))).toBe(`撤回「${"x".repeat(36)}…」？`);
+    expect(undoDialogTitle("Allow unrestricted host access?")).toBe("Allow unrestricted host access?");
+    expect(approvalTitle("Allow unrestricted host access?")).toBe("允许访问本机");
+    expect(approvalTitle("Allow network access?")).toBe("允许访问网络");
+    expect(approvalTitle("Apply src/App.tsx?")).toBe("允许改 src/App.tsx");
+    expect(approvalTitle("Allow exec_command?")).toBe("允许调用 exec_command");
+  });
+
+  it("breaks thinking walls into list-friendly lines", () => {
+    expect(formatThinking("看一下结构 1. `a.ts` 2. `b.ts` - 当前结构 - 对接时需要做的事")).toBe([
+      "看一下结构",
+      "1. `a.ts`",
+      "2. `b.ts`",
+      "- 当前结构",
+      "- 对接时需要做的事",
+    ].join("\n"));
+  });
+
+  it("splits long live thinking into visible steps", () => {
+    expect(thoughtSteps([
+      { type: "thinking", id: "t1", text: "先看结构 1. `a.ts` 2. `b.ts` - 当前结构 - 对接时需要做的事" },
+    ], []).map((step) => step.text)).toEqual([
+      "先看结构",
+      "1. `a.ts`",
+      "2. `b.ts`",
+      "- 当前结构",
+      "- 对接时需要做的事",
+    ]);
+  });
+
+  it("strips model think tags so they are not shown as raw markup", () => {
+    expect(formatThinking("<thinking>Inspecting key file contents for summary</thinking>"))
+      .toBe("Inspecting key file contents for summary");
+  });
+
+  it("hides <thinking> blocks from the visible assistant reply", () => {
+    const messages = applyAgentEvent([], {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "<thinking>Inspecting related pages for consistent navigation</thinking>" }],
+      },
+    });
+    expect(messages[0]?.text).toBe("");
+    expect(messages[0]?.thinking).toBe("Inspecting related pages for consistent navigation");
+  });
+
+  it("builds one jump anchor per real user question", () => {
+    const messages = normalizeMessages([
+      { role: "user", content: [{ type: "text", text: "新增友链页面\n顺便加个入口" }] },
+      { role: "assistant", content: [{ type: "text", text: "好" }] },
+      { role: "user", content: [{ type: "text", text: "/undo" }] },
+      { role: "user", content: [{ type: "text", text: "修复样式问题" }] },
+    ]);
+    const anchors = turnAnchors(groupConversation(messages));
+    expect(anchors.map((item) => item.label)).toEqual(["新增友链页面 顺便加个入口", "修复样式问题"]);
+    expect(anchors[0]?.id).toBe(turnAnchorId(messages[0]!.id));
+  });
+
+  it("reads the folder name from both posix and windows paths", () => {
+    expect(baseName("/Users/code/ember")).toBe("ember");
+    expect(baseName("D:\\code\\agnes-images")).toBe("agnes-images");
+    expect(baseName("D:\\code\\agnes-images\\")).toBe("agnes-images");
+    expect(baseName("src/renderer/ui.tsx")).toBe("ui.tsx");
+  });
+});

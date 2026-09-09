@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # One-click release from the Actions tab: pick a tag, hit Run workflow.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag, e.g. v0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: mac
+          - os: windows-latest
+            target: win
+
+    runs-on: ${{ matrix.os }}
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.12.2
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build desktop app
+        run: pnpm build:electron && pnpm build:renderer
+
+      - name: Pack installer
+        env:
+          # Use the ad-hoc identity from electron-builder.yml; skip keychain discovery.
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: pnpm exec electron-builder --${{ matrix.target }}
+
+      # Only ship the two installers — never blockmap / yaml / unpacked dirs.
+      - name: Stage release assets
+        id: stage
+        run: |
+          mkdir -p release-upload
+          if [ "${{ matrix.target }}" = "mac" ]; then
+            cp release/*.dmg release-upload/
+          else
+            cp release/*.exe release-upload/
+          fi
+          ls -la release-upload
+          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: Ember ${{ steps.stage.outputs.version }}
+          files: release-upload/*
+          fail_on_unmatched_files: true
+          body: |
+            ## Downloads
+            - macOS (Apple Silicon): `Ember-${{ steps.stage.outputs.version }}-arm64.dmg`
+            - Windows (x64): `Ember-Setup-${{ steps.stage.outputs.version }}.exe`
+
+            ## Notes
+            - Local-first AI coding workbench
+            - Supports DeepSeek and custom OpenAI-compatible endpoints
+            - If macOS says the app can't be opened, right-click → Open, or run:
+              `xattr -cr /Applications/Ember.app`
+
+            Feedback: https://github.com/Zhouyeming1/Ember/issues

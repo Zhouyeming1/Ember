@@ -1,0 +1,9 @@
+packages:
+  - "."
+allowBuilds:
+  electron: true
+  esbuild: true
+  electron-winstaller: true
+  protobufjs: true
+  "@google/genai": false
+minimumReleaseAgeExclude: []
