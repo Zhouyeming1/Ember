@@ -4753,10 +4753,78 @@ kbd {
   color: var(--ink);
 }
 
+/* ── 奔跑的小猫（活动指示器）── */
+.running-cat {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  line-height: 0;
+  color: inherit;
+  vertical-align: middle;
+}
+.running-cat svg {
+  display: block;
+  width: 20px;
+  height: auto;
+  overflow: visible;
+}
+.running-cat svg > * {
+  fill: currentColor;
+}
+.running-cat svg .rc-tail,
+.running-cat svg .rc-leg {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.5;
+  stroke-linecap: round;
+}
+.running-cat .rc-bob {
+  animation: rc-bob 0.4s ease-in-out infinite;
+}
+.running-cat .rc-leg {
+  transform-box: view-box;
+  animation: rc-leg 0.4s linear infinite;
+}
+.running-cat .rc-leg-a {
+  transform-origin: 11px 13px;
+}
+.running-cat .rc-leg-b {
+  transform-origin: 24px 13px;
+  animation-delay: -0.2s;
+}
+@keyframes rc-leg {
+  0%,
+  100% {
+    transform: rotate(24deg);
+  }
+  50% {
+    transform: rotate(-24deg);
+  }
+}
+@keyframes rc-bob {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-1px);
+  }
+}
+/* 标题栏品牌位：替换 logo 时尺寸对齐原 logo（24×14） */
+.brand-run svg {
+  width: 24px;
+  height: auto;
+}
+/* 生成中的 trace 行里小一点 */
+.trace-toggle .running-cat svg {
+  width: 18px;
+}
 @media (prefers-reduced-motion: reduce) {
   .dots i,
   .trace.live .shimmer,
-  .caret {
+  .caret,
+  .running-cat .rc-bob,
+  .running-cat .rc-leg {
     animation: none;
   }
 }

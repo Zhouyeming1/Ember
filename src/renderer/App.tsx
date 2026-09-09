@@ -1245,6 +1245,7 @@ export function App() {
       <SidebarNav
         onNew={() => void newThread()}
         onOpen={() => void openFolder()}
+        running={running}
         account={(
           <AccountMenu
             model={model}

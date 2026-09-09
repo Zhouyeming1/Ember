@@ -149,12 +149,34 @@ function CopyAction({ text }: { text: string }) {
   return <CopyButton text={text} />;
 }
 
-export function Dots() {
+/** 奔跑的小猫：活动指示器（生成中/加载中）。纯 CSS 摆腿 + 起伏，无图片帧。 */
+export function RunningCat({ className }: { className?: string }) {
   return (
-    <span className="dots" aria-hidden="true">
-      {Array.from({ length: 9 }, (_, index) => <i key={index} />)}
+    <span className={["running-cat", className].filter(Boolean).join(" ")} aria-hidden="true">
+      <svg viewBox="0 0 34 20" role="presentation">
+        <g className="rc-bob">
+          {/* 尾巴 */}
+          <path className="rc-tail" d="M 27.5 8.2 Q 31.6 7 30.4 3.4" />
+          {/* 身体 + 头 + 耳（实心剪影） */}
+          <ellipse cx="17.2" cy="10" rx="11" ry="4.6" />
+          <circle cx="8.6" cy="7.4" r="4.8" />
+          <path d="M 6.4 3.6 L 5.6 0.6 L 10 3.2 Z" />
+        </g>
+        {/* 前后腿（各自绕髋部摆动，相位相反） */}
+        <g className="rc-leg rc-leg-a">
+          <line x1="11" y1="12.6" x2="11" y2="18.2" />
+        </g>
+        <g className="rc-leg rc-leg-b">
+          <line x1="24" y1="12.6" x2="24" y2="18.2" />
+        </g>
+      </svg>
     </span>
   );
+}
+
+/** 活动指示：原来是三个点，现在让小猫奔跑。保留名称以兼容调用方。 */
+export function Dots() {
+  return <RunningCat />;
 }
 
 function formatDuration(start?: number, end?: number) {
@@ -180,11 +202,13 @@ export function SidebarNav({
   onNew,
   onOpen,
   account,
+  running = false,
   children,
 }: {
   onNew(): void;
   onOpen(): void;
   account: ReactNode;
+  running?: boolean;
   children: ReactNode;
 }) {
   const { t } = useI18n();
@@ -192,7 +216,11 @@ export function SidebarNav({
     <aside className="sidebar">
       <header className="sidebar-titlebar">
         <div className="sidebar-brand">
-          <img className="brand-mark" src={logo} alt="" width={24} height={14} />
+          {running ? (
+            <RunningCat className="brand-run" />
+          ) : (
+            <img className="brand-mark" src={logo} alt="" width={24} height={14} />
+          )}
           <strong>Ember</strong>
         </div>
       </header>

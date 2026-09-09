@@ -11,3 +11,6 @@ __pycache__/
 .pytest_cache/
 runtime-py/.venv
 *.egg-info/
+
+# 本地环境变量（勿提交）
+.env
