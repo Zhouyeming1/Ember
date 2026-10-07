@@ -52,6 +52,7 @@ from ..skills import SkillStore, resolve_skill_roots
 from ..permission.modes import effective_mode
 from ..session import Session, allocate_session_path
 from ..tools import ToolEnv
+from ..tools.agent_tool import SUBAGENT_TOOL_NAME
 from .transcript import Transcript, now_ms, pi_message, text_part, thinking_part, tool_part
 from .ui import UiConfirm
 
@@ -162,6 +163,47 @@ def _desktop_sessions_known() -> bool:
 
 def _is_error_result(text: str) -> bool:
     return text.startswith(_IS_ERROR_PREFIXES)
+
+
+def _is_deepseek_family(model: str) -> bool:
+    """思考等级↔模型名这套映射只对 DeepSeek 成立（见 _resolve_model）。"""
+    return model.lower().startswith("deepseek")
+
+
+# 子 agent 工具在**发给界面的事件里**叫什么。引擎注册表名是 run_agent（模型按它调用、
+# 子 agent 派生逻辑按它裁剪工具池，都动不得），但渲染层那套委托进度卡是按 `delegate`
+# 认的：按 id 归并的 upsert 会拿 end 事件的 toolName 覆盖 start 的，所以 start 和 end
+# 必须一起映射，只改一处卡片反而会半路变回普通工具行。改这里不新增事件类型。
+_DISPLAY_TOOL_NAMES = {
+    SUBAGENT_TOOL_NAME: "delegate",
+    # SQL 三个工具：渲染层 toolTitle 认不出这几个名字就走兜底
+    # （name.replaceAll("_"," ") 再首字母大写 → "Sql impact"），给中文更清楚。
+    # 注意别把工具改名成 sql_reader / sql_rewrite 之类：渲染层按字面量正则分卡片
+    # （/write|edit|patch/、/grep|glob|search|find/、/read|cat|view/），
+    # 命中就会被误画成写文件/读文件卡片。sql_lineage/impact/lint 都不命中。
+    "sql_lineage": "SQL 血缘",
+    "sql_impact": "影响面分析",
+    "sql_lint": "SQL 规范检查",
+}
+
+
+def _display_tool_name(name: str) -> str:
+    return _DISPLAY_TOOL_NAMES.get(name, name)
+
+
+def _display_tool_args(name: str, arguments: Any) -> Any:
+    """工具事件里带的入参。run_agent 额外摆出一个 `tasks` 数组。
+
+    委托进度卡的每一行（角色 + 任务文字 + 状态）都是从 `args.tasks` 取的，没有它
+    卡片只剩"委托"两个字。原参数一并保留，界面上展开参数时仍能看到完整 prompt。
+    """
+    if name != SUBAGENT_TOOL_NAME or not isinstance(arguments, dict):
+        return arguments
+    if "tasks" in arguments:
+        return arguments
+    role = arguments.get("agent_type") or "general"
+    task = arguments.get("description") or arguments.get("prompt") or ""
+    return {**arguments, "tasks": [{"role": str(role), "task": str(task)}]}
 
 
 def _permission_notice(mode: PermissionMode) -> str:
@@ -390,11 +432,13 @@ class Worker:
     def _resolve_model(self) -> str:
         """思考等级 = 模型开关：等级 off 用聊天模型，其余用 reasoner。
 
-        等级还没同步（UI 没下发，例如无界面直接跑）时跟随显式模型选择，
-        不改变默认行为。
+        这套对应**只对 DeepSeek 成立**。别的 provider（GLM/Kimi/codex…）没有"等级
+        换模型名"的约定，硬套会把配置里写的模型名默默换掉——而桌面端每次启动都会
+        发一次 set_thinking_level（App.tsx），所以不拦这一下，换个 provider 配什么
+        模型都白配。等级还没同步（无界面直接跑）时也跟随显式模型选择。
         """
         level = self._thinking_level
-        if level is None:
+        if level is None or not _is_deepseek_family(self.model):
             return self.model
         return "deepseek-chat" if level == "off" else "deepseek-reasoner"
 
@@ -438,7 +482,9 @@ class Worker:
 
     def _available_models(self) -> list[dict[str, Any]]:
         window = self._context_window
-        models = [
+        # 只有 deepseek 才列 chat/reasoner 这对；别的 provider 只列当前配置的模型，
+        # 否则下拉里会挂着两个选了也跑不通的 deepseek 名字。
+        models = [] if not _is_deepseek_family(self.model) else [
             {"provider": self.provider, "id": "deepseek-chat", "contextWindow": window},
             {"provider": self.provider, "id": "deepseek-reasoner", "contextWindow": window, "reasoning": True},
         ]
@@ -912,7 +958,10 @@ class Worker:
                 arguments = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
             except json.JSONDecodeError:
                 arguments = {}
-            tool_parts.append(tool_part(str(call.get("id", "")), str(fn.get("name", "")), arguments))
+            name = str(fn.get("name", ""))
+            tool_parts.append(
+                tool_part(str(call.get("id", "")), _display_tool_name(name), _display_tool_args(name, arguments))
+            )
         reasoning = raw.get("reasoning_content")
         thinking = reasoning.strip() if isinstance(reasoning, str) and reasoning.strip() else None
         return text, tool_parts, thinking
@@ -975,12 +1024,13 @@ class Worker:
 
     def _handle_tool_call(self, data: dict[str, Any]) -> None:
         self._open = True
+        name = str(data.get("name", "tool"))
         self.out.emit(
             {
                 "type": "tool_execution_start",
-                "toolName": data.get("name", "tool"),
+                "toolName": _display_tool_name(name),
                 "toolCallId": str(data.get("id", "")),
-                "args": data.get("arguments") or {},
+                "args": _display_tool_args(name, data.get("arguments") or {}),
                 "timestamp": now_ms(),
             }
         )
@@ -999,7 +1049,7 @@ class Worker:
         self.out.emit(
             {
                 "type": "tool_execution_end",
-                "toolName": data.get("name", "tool"),
+                "toolName": _display_tool_name(str(data.get("name", "tool"))),
                 "toolCallId": tool_call_id,
                 "isError": is_error,
                 "result": result_text,

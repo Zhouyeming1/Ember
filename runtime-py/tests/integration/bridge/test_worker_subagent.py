@@ -59,12 +59,18 @@ def test_worker_main_agent_spawns_subagent_and_relays(workspace: Path) -> None:
     run_prompt(worker, sink, "帮我数函数")
 
     lines = _lines(sink)
-    # 主 agent 派生：出现 run_agent 工具轨迹
+    # 主 agent 派生：事件里的展示名是 delegate（界面那套委托进度卡按它认），
+    # 并带上 tasks 数组供卡片逐行渲染角色/任务/状态
     starts = [o for o in lines if o.get("type") == "tool_execution_start"]
-    assert any(o.get("toolName") == "run_agent" for o in starts)
-    # 子 agent 最终文本成为 run_agent 的工具结果
-    ends = [o for o in lines if o.get("type") == "tool_execution_end" and o.get("toolName") == "run_agent"]
+    assert any(o.get("toolName") == "delegate" for o in starts)
+    spawn = next(o for o in starts if o.get("toolName") == "delegate")
+    assert spawn["args"]["tasks"] == [{"role": "explore", "task": "统计符号"}]
+    assert spawn["args"]["prompt"] == "数一下 main.py 里有多少个函数"  # 原参数保留
+    # 子 agent 最终文本成为 delegate 的工具结果；end 也必须用展示名，否则按 id
+    # 归并时会把 start 的名字覆盖回 run_agent，卡片半路失效
+    ends = [o for o in lines if o.get("type") == "tool_execution_end" and o.get("toolName") == "delegate"]
     assert ends and "子答复：共 3 个函数" in ends[0]["result"]
+    assert not any(o.get("toolName") == "run_agent" for o in lines if o.get("type", "").startswith("tool_"))
     # 主 agent 最终答复
     assert any("主答复：已让子 agent 数完" in _assistant_text(o) for o in lines if o.get("type") == "message_end")
     # 子 agent 的会话是临时的，主会话事件里只有一轮（user + 带 run_agent 的 assistant + tool + assistant）

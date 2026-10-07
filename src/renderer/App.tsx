@@ -225,6 +225,10 @@ function SessionRow({
 
 const SANDBOX_OK_KEY = "ember:unsandboxed-projects";
 
+// 点停止后给引擎多久自己停稳。引擎收到 abort 就不再开新工具，剩下的只是等在跑的那
+// 一条命令结束——正常几秒内就会发 agent_settled。超过这个时间就认为它卡住了，强杀。
+const STOP_TIMEOUT_MS = 10_000;
+
 function allowedProjects(): Set<string> {
   try {
     const raw = JSON.parse(localStorage.getItem(SANDBOX_OK_KEY) ?? "[]") as unknown;
@@ -377,6 +381,9 @@ export function App() {
   const [loginOpen, setLoginOpen] = useState(false);
   const [sandboxAsk, setSandboxAsk] = useState<{ cwd: string; message: string }>();
   const sandboxWaiter = useRef<((ok: boolean) => void) | undefined>(undefined);
+  // 点停止后的强杀计时器：引擎收到 abort 会立刻不再开新工具，但已经在跑的那条命令
+  // （可能是卡住的 dev server）不会自己结束，等它就会把界面永远锁在"运行中"。
+  const stopTimer = useRef<number | undefined>(undefined);
   const [toast, setToast] = useState<string>();
   useEffect(() => {
     if (!toast) return;
@@ -1072,7 +1079,11 @@ export function App() {
   useEffect(() => {
     const offEvent = window.ember.agent.onEvent((event) => {
       if (!live.current) return;
-      if (event.type === "agent_start") setRunning(true);
+      if (event.type === "agent_start") {
+        if (stopTimer.current !== undefined) window.clearTimeout(stopTimer.current);
+        stopTimer.current = undefined;
+        setRunning(true);
+      }
       if (event.type === "desktop_snapshot_meta") {
         if (Array.isArray(event.models)) {
           agentModelsRef.current = event.models as typeof agentModelsRef.current;
@@ -1082,6 +1093,8 @@ export function App() {
         if (event.stats && typeof event.stats === "object") setStats(event.stats as AgentSessionStats);
       }
       if (event.type === "agent_settled") {
+        if (stopTimer.current !== undefined) window.clearTimeout(stopTimer.current);
+        stopTimer.current = undefined;
         setRunning(false);
         setUiRequest(undefined);
         void window.ember.agent.command<AgentSessionStats>("get_session_stats").then((nextStats) => {
@@ -1191,11 +1204,33 @@ export function App() {
       onSubmit={(text, images) => void sendMessage(text, images)}
       onStop={() => {
         setToast(t("toast.stopping"));
-        void window.ember.agent.command("abort")
-          .catch(() => undefined)
-          .finally(() => {
+        // 收到 abort 后引擎只是"不再开新工具"，已经在跑的那条要等它自己结束——这期间
+        // 它可能还在写文件。所以这里**不**解除运行中状态：等 agent_settled（引擎真正
+        // 停稳）再说。提前解锁会让用户以为停了、其实文件还在被改。
+        void window.ember.agent.command("abort").catch(() => undefined);
+        if (stopTimer.current !== undefined) window.clearTimeout(stopTimer.current);
+        stopTimer.current = window.setTimeout(() => {
+          stopTimer.current = undefined;
+          if (!live.current) return;
+          // 超时还没停稳：多半是某条命令卡住了（跑命令是一次性阻塞等待，abort 打断
+          // 不了它）。只能杀掉整个进程树——不能让界面永远锁在"运行中"。
+          void (async () => {
+            const cwd = workspace ?? agentCwd.current;
+            await window.ember.agent.stop().catch(() => undefined);
+            if (!live.current) return;
+            // 进程没了，不会再有 agent_settled：把还挂着"运行中"的工具卡收尾，
+            // 否则它们会一直转圈
+            setMessages((current) => finalizeInterruptedTurn(current));
             setRunning(false);
-          });
+            setToast(t("toast.stopped"));
+            // 按原会话立刻把引擎拉起来。不重启的话下一条消息会打到一个已经关掉的
+            // 进程上；而 sendMessage 只在 agentCwd 为空时才重启、且不带会话路径，
+            // 那样会新起一个空会话把上下文丢掉。所以照 ensureModelReady 的写法，
+            // 在这里显式带上 sessionRef 重启。
+            agentCwd.current = undefined;
+            if (cwd) await startAgent(cwd, sessionRef.current, Boolean(workspace), true);
+          })();
+        }, STOP_TIMEOUT_MS);
       }}
       steering={steering}
       rootRef={dock}

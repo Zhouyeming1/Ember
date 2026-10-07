@@ -135,6 +135,7 @@ const zh = {
   "toast.errorTimeout": "模型响应超时，请稍后重试",
   "toast.errorStreamInterrupted": "模型流中断了（常见于停止委派后立刻继续）。点「继续」再试一次，或换个更稳的模型。",
   "toast.stopping": "正在停止…",
+  "toast.stopped": "已强制停止：引擎没有在预期时间内停下，已终止其进程。",
   "toast.steered": "已插话",
   "composer.retryContinue": "请从中断处继续，不要重复已完成的步骤。",
   "toast.errorEndpoint":
@@ -570,6 +571,7 @@ const en: Record<MessageKey, string> = {
   "toast.errorStreamInterrupted":
     "The model stream broke (common after stopping a delegate). Click Continue, or switch to a more stable model.",
   "toast.stopping": "Stopping…",
+  "toast.stopped": "Force-stopped: the engine did not settle in time, so its process was killed.",
   "toast.steered": "Steered",
   "composer.retryContinue": "Continue from where we left off. Do not redo completed steps.",
   "toast.errorEndpoint":

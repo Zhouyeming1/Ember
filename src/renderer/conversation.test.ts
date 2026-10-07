@@ -1008,6 +1008,60 @@ describe("conversation events", () => {
     ]);
   });
 
+  it("lifts the unified diff an emberpy write tool appends into the drawer patch", () => {
+    const files = collectFileChanges([{
+      id: "1",
+      name: "file_edit",
+      title: "Edited demo.py",
+      status: "complete",
+      args: { path: "demo.py" },
+      output: [
+        "已修改 修改 demo.py（seq=1）",
+        "files: demo.py",
+        "diff: +1 -1",
+        "--- a/demo.py",
+        "+++ b/demo.py",
+        "@@ -1,5 +1,5 @@",
+        " def add(a, b):",
+        "-    return a - b",
+        "+    return a + b",
+        "",
+      ].join("\n"),
+    }]);
+    expect(files).toEqual([{
+      path: "demo.py",
+      additions: 1,
+      deletions: 1,
+      patch: expect.stringContaining("-    return a - b"),
+    }]);
+    expect(splitPatch(files[0]!.patch!)).toContainEqual({ kind: "add", old: "", next: "    return a + b" });
+  });
+
+  it("leaves new files patchless and drops truncated diffs", () => {
+    const write = (output: string) => collectFileChanges([{
+      id: "1",
+      name: "write_file",
+      title: "Wrote demo.py",
+      status: "complete",
+      args: { path: "demo.py" },
+      output,
+    }]);
+    // 新建文件不回灌 diff 正文：只有统计，抽屉不出现"查看改动"
+    expect(write("已写入 新建 demo.py（12 字符，seq=1）\nfiles: demo.py\ndiff: +3 -0")).toEqual([
+      { path: "demo.py", additions: 3, deletions: 0 },
+    ]);
+    // 截断的 diff 画成拆分视图会误导，宁可不给
+    const truncated = write([
+      "已修改 修改 demo.py（seq=2）",
+      "files: demo.py",
+      "diff: +1 -1",
+      "--- a/demo.py",
+      "+++ b/demo.py",
+      "… （diff 已截断，另有 40 行未显示）",
+    ].join("\n"));
+    expect(truncated).toEqual([{ path: "demo.py", additions: 1, deletions: 1 }]);
+  });
+
   it("merges the same file when Windows and POSIX paths are mixed", () => {
     expect(collectFileChanges([{
       id: "1",

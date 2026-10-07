@@ -8,12 +8,18 @@ v1 采用"整文件内容"补丁而不是行级 diff——实现简单、语义�
 """
 from __future__ import annotations
 
+import difflib
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Optional
 
 from ..errors import FileToolError, NotTextFileError
+
+
+def _lines(text: Optional[str]) -> list[str]:
+    """按行切分（不带换行符）。None 表示"该侧文件不存在"，当空内容处理。"""
+    return [] if not text else text.splitlines()
 
 
 @dataclass(frozen=True)
@@ -36,11 +42,42 @@ class Patch:
         action = "新建" if self.before is None else ("删除" if self.after is None else "修改")
         return f"{action} {self.path.name}"
 
-    def changed_lines(self) -> int:
-        """粗略行数变化（仅用于展示）。"""
-        b = 0 if self.before is None else self.before.count("\n") + 1
-        a = 0 if self.after is None else self.after.count("\n") + 1
-        return abs(a - b)
+    def diff_stats(self) -> tuple[int, int]:
+        """(新增行数, 删除行数)。按行级最小编辑算——同一处"改一行"记 +1/-1。"""
+        before, after = _lines(self.before), _lines(self.after)
+        added = removed = 0
+        matcher = difflib.SequenceMatcher(None, before, after)
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag in ("replace", "delete"):
+                removed += i2 - i1
+            if tag in ("replace", "insert"):
+                added += j2 - j1
+        return added, removed
+
+    def unified_diff(self, context: int = 3, max_lines: int = 60) -> str:
+        """本补丁的 unified diff 文本；两侧内容相同则返回 ""。
+
+        用途有二：回给模型让它核对"我到底改了什么"（这是自我纠正的前提），以及
+        落进工具输出供界面按 +/- 着色。它服务于快速核对而非完整审计，所以超过
+        max_lines 行会截断——但截断必须显式写出来，否则读者会以为改动就这么点。
+        """
+        before, after = _lines(self.before), _lines(self.after)
+        if before == after:
+            return ""
+        name = self.path.name
+        chunks = list(
+            difflib.unified_diff(
+                before,
+                after,
+                fromfile=f"a/{name}",
+                tofile=f"b/{name}",
+                n=context,
+                lineterm="",  # 自己 join，避免 difflib 在末行不带换行时拼出粘连
+            )
+        )
+        if len(chunks) > max_lines:
+            chunks = chunks[:max_lines] + [f"… （diff 已截断，另有 {len(chunks) - max_lines} 行未显示）"]
+        return "\n".join(chunks)
 
 
 def _read_text(path: Path) -> Optional[str]:

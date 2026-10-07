@@ -236,7 +236,15 @@ class Agent:
                 final_content = reply.content
                 break
 
-            for call in reply.tool_calls:
+            for index, call in enumerate(reply.tool_calls):
+                if self._stop_requested():
+                    # 用户点了停止：这一批里还没开跑的工具一个都不执行——尤其是写文件的。
+                    # 只在外层 while 顶部检查是不够的，模型一次要调好几个工具时，那批
+                    # 会照跑完，"以为停了其实还在改文件"就是这么来的。
+                    interrupted = True
+                    for skipped in reply.tool_calls[index:]:
+                        self._record_skipped_tool(skipped, messages)
+                    break
                 steps += 1
                 self._emit("tool_call", {"id": call.id, "name": call.name, "arguments": call.arguments})
                 result, denied = self._execute(call)
@@ -421,6 +429,21 @@ class Agent:
     def _stop_requested(self) -> bool:
         rt = self.runtime_input
         return bool(rt and rt.stop_requested and rt.stop_requested())
+
+    def _record_skipped_tool(self, call, messages: list[Message]) -> None:
+        """给"因中止而没执行"的工具补一条结果。
+
+        补这一条不是为了好看：assistant 消息里带着 tool_calls，就必须每条都有对应的
+        tool 消息，否则这条 assistant 是非法的，下次接着跑或 resume 时会被模型 API
+        直接拒绝。跳过也要留下痕迹，模型续跑时才知道这些没跑过。
+        """
+        note = "已跳过：用户中止了本轮，该工具未执行。"
+        self.session.add_tool_result(call.id, note)
+        messages.append({"role": "tool", "tool_call_id": call.id, "content": note})
+        self._emit(
+            "tool_result",
+            {"id": call.id, "name": call.name, "denied": False, "preview": note, "result": note},
+        )
 
     def _drain_steers(self, messages: list[Message]) -> None:
         """把积压的 steer 消息作为 user 消息插入（下一轮模型调用前）。"""

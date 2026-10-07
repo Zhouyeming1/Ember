@@ -6,7 +6,7 @@ from pathlib import Path
 from emberpy.agent import Agent, RuntimeInput, run_once
 from emberpy.permission import PermissionMode
 from emberpy.session import Session
-from emberpy.testing import FakeLLM
+from emberpy.testing import FakeLLM, tool_call
 from emberpy.tools import ToolEnv
 
 
@@ -43,6 +43,48 @@ def test_stop_requested_halts_between_rounds(workspace: Path) -> None:
     result2 = agent.run("再来一轮")
     assert result2.interrupted is True
     assert result2.final_content is None
+
+
+def test_stop_halts_remaining_tools_in_the_same_batch(workspace: Path) -> None:
+    """停止要能在"一批工具跑到一半"时生效——那批剩下的绝不能再执行。
+
+    只在每轮模型调用前查一次是不够的：模型一次要调好几个工具时，那批会照跑完，
+    用户以为停了、文件却还在被改，就是这么来的。
+    """
+    script = [
+        {
+            "content": "一次改两个文件",
+            "calls": [
+                tool_call("c1", "write_file", {"path": "a.txt", "content": "第一个"}),
+                tool_call("c2", "write_file", {"path": "b.txt", "content": "第二个"}),
+            ],
+        },
+        {"content": "完成了", "calls": None},
+    ]
+    stopped = {"flag": False}
+
+    def on_event(type_: str, _data: dict) -> None:
+        # 第一个工具刚广播出去（正要执行）时叫停——模拟用户在这一批跑的过程中点停止
+        if type_ == "tool_call":
+            stopped["flag"] = True
+
+    agent = _agent(
+        script,
+        workspace,
+        on_event=on_event,
+        runtime_input=RuntimeInput(stop_requested=lambda: stopped["flag"]),
+    )
+    result = agent.run("改两个文件")
+
+    assert result.interrupted is True
+    assert (workspace / "a.txt").exists()  # 叫停前已经在跑的那个照常完成
+    assert not (workspace / "b.txt").exists()  # 这一批剩下的一个都没执行
+
+    # 被跳过的 tool_call 必须补上结果：否则这条 assistant 带着"没有结果的 tool_call"，
+    # 下次接着跑或 resume 时会被模型 API 拒绝
+    results = [event for event in agent.session.events() if event.get("type") == "tool"]
+    assert [r["message"]["tool_call_id"] for r in results] == ["c1", "c2"]
+    assert "已跳过" in results[1]["message"]["content"]
 
 
 def test_steer_injected_as_user_turn(workspace: Path) -> None:

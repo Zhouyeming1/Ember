@@ -8,6 +8,7 @@ from .plan_tool import build_update_plan_tool
 from .registry import AskValue, Tool, ToolCategory, ToolEnv, ToolRegistry
 from .shell import build_shell_tool, run_shell
 from .skill_tool import build_skill_tool
+from .sql_tools import build_sql_tools
 from .vision import build_vision_tool
 from .web import build_web_tools
 
@@ -23,6 +24,7 @@ __all__ = [
     "build_memory_tools",
     "build_shell_tool",
     "build_skill_tool",
+    "build_sql_tools",
     "build_update_plan_tool",
     "build_vision_tool",
     "build_web_tools",
@@ -51,6 +53,7 @@ def default_registry(env: ToolEnv) -> ToolRegistry:
     tools.append(build_shell_tool(env))
     tools.append(build_vision_tool(env))  # 图片识别：只读上传目录/工作区图，需视觉 key
     tools.extend(build_web_tools(env))  # 联网搜索/抓页：需设置里配的搜索 key
+    tools.extend(build_sql_tools(env))  # 数仓血缘/影响面/规范检查：只读，需可选依赖 sqlglot
     if env.mcp is not None:
         # MCP 工具放最后：最"外部"、低优先，先给模型看到本地工具
         tools.extend(build_mcp_tools(env))

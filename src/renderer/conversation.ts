@@ -1714,6 +1714,21 @@ function changesFromPatch(input: string): FileChange[] {
   }));
 }
 
+/**
+ * 引擎在写文件工具的输出末尾附的 unified diff 正文，抽出来给文件抽屉画拆分视图。
+ *
+ * 没有正文（新建文件不回灌、改动为空）返回 ""；被截断的也返回 ""——截断的 diff 画成
+ * 拆分视图会让人以为文件就改到这里，不如只保留上面那行 +/- 统计。
+ */
+function diffBodyFromOutput(output: string): string {
+  const lines = output.replaceAll("\r\n", "\n").split("\n");
+  const start = lines.findIndex((line) => line.startsWith("--- "));
+  if (start < 0) return "";
+  const body = lines.slice(start);
+  if (body.some((line) => line.startsWith("…"))) return "";
+  return body.join("\n");
+}
+
 function changesFromOutput(output?: string): FileChange[] {
   if (!output) return [];
   const diff = /(?:diff: )?\+(\d+)\s+-(\d+)/.exec(output);
@@ -1724,7 +1739,9 @@ function changesFromOutput(output?: string): FileChange[] {
   if (files.length === 0) return [];
   const additions = diff ? Number(diff[1]) : 0;
   const deletions = diff ? Number(diff[2]) : 0;
-  if (files.length === 1) return [{ path: files[0]!, additions, deletions }];
+  // 正文只对应 `files:` 里那一个文件；多文件时无法归属，只保留统计。
+  const patch = files.length === 1 ? diffBodyFromOutput(output) : "";
+  if (files.length === 1) return [{ path: files[0]!, additions, deletions, ...(patch ? { patch } : {}) }];
   return files.map((path) => ({ path, additions: 0, deletions: 0 }));
 }
 

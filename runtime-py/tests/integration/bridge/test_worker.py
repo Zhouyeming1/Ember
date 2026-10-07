@@ -428,3 +428,31 @@ def test_thinking_level_switches_model(workspace: Path) -> None:
     rpc_send(w, "set_model", "m2", modelId="deepseek-reasoner")
     d = state()
     assert d["model"] == "deepseek-reasoner" and d["thinkingLevel"] == "high"
+
+
+def test_thinking_level_does_not_clobber_non_deepseek_model(workspace: Path) -> None:
+    """非 deepseek provider：等级不该把配好的模型名换掉。
+
+    桌面端每次启动都发 set_thinking_level，所以这条不拦，"配 GLM 却跑 deepseek"
+    就会是常态——多模型直接成为空谈。
+    """
+    w, sink = make_worker(workspace, [], provider="glm", model="glm-4.6")
+
+    def state() -> dict[str, Any]:
+        rpc_send(w, "get_state", "q")
+        return last_response(sink, "q")["data"]
+
+    assert state()["model"] == "glm-4.6"
+
+    rpc_send(w, "set_thinking_level", "l1", level="high")
+    d = state()
+    assert d["model"] == "glm-4.6"  # 等级只记录，不换模型
+    assert d["thinkingLevel"] == "high"
+
+    rpc_send(w, "set_thinking_level", "l2", level="off")
+    assert state()["model"] == "glm-4.6"
+
+    # 下拉里不该挂着选不通的 deepseek 名字，只列当前配置的模型
+    rpc_send(w, "get_available_models", "q2")
+    models = last_response(sink, "q2")["data"]["models"]
+    assert [m["id"] for m in models] == ["glm-4.6"]

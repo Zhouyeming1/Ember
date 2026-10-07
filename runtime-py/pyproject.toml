@@ -13,6 +13,13 @@ dependencies = [
 dev = [
     "pytest>=8",
 ]
+# SQL 血缘/规范检查（sql_lineage / sql_impact / sql_lint）。刻意不做硬依赖：桌面端拿
+# 系统的 python3 跑引擎（agent-host.ts 用 PYTHONPATH 指到 runtime-py），没有内置虚拟
+# 环境，硬依赖会让没装 sqlglot 的机器连引擎都起不来。未安装时三个工具照常注册，调用
+# 时返回"请 pip install sqlglot"的引导错误（同 tools/vision.py 无 key 时的做法）。
+sql = [
+    "sqlglot>=30",
+]
 
 [build-system]
 requires = ["setuptools>=68"]

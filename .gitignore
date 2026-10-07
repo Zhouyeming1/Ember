@@ -14,3 +14,6 @@ runtime-py/.venv
 
 # 本地环境变量（勿提交）
 .env
+
+# 本机 Claude Code 权限配置（含绝对路径），勿提交
+.claude/settings.local.json

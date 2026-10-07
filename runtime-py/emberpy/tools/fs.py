@@ -16,6 +16,7 @@ import re
 from pathlib import Path
 
 from ..errors import FileToolError, NotTextFileError
+from ..patches.store import Patch
 from ..permission import PermissionGate, resolve_within
 from .registry import Tool, ToolCategory, ToolEnv
 
@@ -182,6 +183,28 @@ def _guard_write(env: ToolEnv, target: Path) -> str:
             "查看最新内容，再决定如何修改。"
         )
     return ""
+
+
+def _write_result(headline: str, patch: Patch, path_arg: str) -> str:
+    """写工具的返回值：一行结论 + 规范化的 diff 段落。
+
+    `files:` / `diff: +N -M` 两行是界面认的约定（conversation.ts 的
+    changesFromOutput 按这个格式取"改了哪个文件、增删多少行"），后面跟标准
+    unified diff——模型据此核对"我到底改了什么"，这是自我纠正的前提；界面轨迹
+    也按 +/- 给这些行着色。
+
+    path_arg 必须原样用模型传入的路径：界面按字符串字面量做去重键，换成绝对路径
+    或相对路径都会让同一个文件在改动清单里出现两行。
+
+    新建文件不回灌 diff 正文：内容就是本次入参，模型刚写完不必再读一遍，界面那边
+    write_file 的 content 参数也已经有了预览。只有"改动已有文件"才值得看 diff。
+    """
+    added, removed = patch.diff_stats()
+    lines = [headline, f"files: {path_arg}", f"diff: +{added} -{removed}"]
+    diff = "" if patch.before is None else patch.unified_diff()
+    if diff:
+        lines.append(diff)
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -426,7 +449,9 @@ def build_fs_tools(env: ToolEnv) -> list[Tool]:
             patch = env.patches.apply_write(target, content)
             _record_read(env, target)
             _maybe_activate_skill(env, target)
-            return f"已写入 {patch.summary}（{len(content)} 字符，seq={patch.seq}）"
+            return _write_result(
+                f"已写入 {patch.summary}（{len(content)} 字符，seq={patch.seq}）", patch, path
+            )
         except (FileToolError, NotTextFileError, OSError) as exc:
             return _err(exc)
 
@@ -454,7 +479,7 @@ def build_fs_tools(env: ToolEnv) -> list[Tool]:
             )
             _record_read(env, target)
             _maybe_activate_skill(env, target)
-            return f"已修改 {patch.summary}（seq={patch.seq}）"
+            return _write_result(f"已修改 {patch.summary}（seq={patch.seq}）", patch, path)
         except (FileToolError, NotTextFileError, OSError) as exc:
             return _err(exc)
 
